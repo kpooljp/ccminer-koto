@@ -831,25 +831,29 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 		char data_str[2 * sizeof(work->data) + 1];
 		char *req;
+		int datasize = 80;
+		if (work->sapling) {
+			datasize = 112;
+		}
 
 		for (int i = 0; i < ARRAY_SIZE(work->data); i++)
 			be32enc(work->data + i, work->data[i]);
-		cbin2hex(data_str, (char *)work->data, 80);
+		cbin2hex(data_str, (char *)work->data, datasize);
 		if (work->workid) {
 			char *params;
 			val = json_object();
 			json_object_set_new(val, "workid", json_string(work->workid));
 			params = json_dumps(val, 0);
 			json_decref(val);
-			req = (char*)malloc(128 + 2 * 80 + strlen(work->txs2) + strlen(params));
+			req = (char*)malloc(128 + 2 * datasize + strlen(work->txs2) + strlen(params));
 			sprintf(req,
 				"{\"method\": \"submitblock\", \"params\": [\"%s%s\", %s], \"id\":4}\r\n",
 				data_str, work->txs2, params);
 			free(params);
 		}
 		else {
-			req = (char*)malloc(128 + 2 * 80 + strlen(work->txs2));
-			sprintf(req,
+			req = (char*)malloc(128 + 2 * datasize + strlen(work->txs2));
+                        sprintf(req,
 				"{\"method\": \"submitblock\", \"params\": [\"%s%s\"], \"id\":4}\r\n",
 				data_str, work->txs2);
 		}
@@ -1015,12 +1019,14 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 	int tx_count, tx_size;
 	uchar txc_vi[9];
 	uchar(*merkle_tree)[32] = NULL;
+        uint32_t final_sapling_hash[8];
 	bool coinbase_append = false;
 	bool submit_coinbase = false;
 	bool version_force = false;
 	bool version_reduce = false;
 	json_t *tmp, *txa;
 	bool rc = false;
+        bool sapling = false;
 
 	tmp = json_object_get(val, "mutable");
 	if (tmp && json_is_array(tmp)) {
@@ -1054,20 +1060,17 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 		goto out;
 	}
 	version = (uint32_t)json_integer_value(tmp);
-	if ((version & 0xffU) > BLOCK_VERSION_CURRENT) {
+	if (version == 5) {
+		sapling = true;
+	} else if (version > 4) {
 		if (version_reduce) {
-			version = (version & ~0xffU) | BLOCK_VERSION_CURRENT;
-		}
-		else if (allow_gbt && allow_getwork && !version_force) {
-			applog(LOG_DEBUG, "Switching to getwork, gbt version %d", version);
-			allow_gbt = false;
-			goto out;
-		}
-		else if (!version_force) {
+			version = 4;
+		} else if (!version_force) {
 			applog(LOG_ERR, "Unrecognized block version: %u", version);
 			goto out;
 		}
 	}
+
 
 	if (unlikely(!jobj_binary(val, "previousblockhash", prevhash, sizeof(prevhash)))) {
 		applog(LOG_ERR, "JSON invalid previousblockhash");
@@ -1084,6 +1087,13 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 	if (unlikely(!jobj_binary(val, "bits", &bits, sizeof(bits)))) {
 		applog(LOG_ERR, "JSON invalid bits");
 		goto out;
+	}
+
+	if (sapling) {
+		if (unlikely(!jobj_binary(val, "finalsaplingroothash", final_sapling_hash, sizeof(final_sapling_hash)))) {
+			applog(LOG_ERR, "JSON invalid finalsaplingroothash");
+			goto out;
+		}
 	}
 
 	/* find count and size of transactions */
@@ -1236,9 +1246,21 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
 	work->data[17] = swab32(curtime);
 	work->data[18] = le32dec(&bits);
-	memset(work->data + 19, 0x00, 52);
-	work->data[20] = 0x80000000;
-	work->data[31] = 0x00000280;
+
+	if (sapling) {
+		work->sapling = true;
+		memset(work->data + 28, 0x00, 48);
+		for (i = 0; i < 8; i++)
+			work->data[27 - i] = le32dec(final_sapling_hash + i);
+		work->data[19] = 0;
+		work->data[28] = 0x80000000;
+		work->data[39] = 0x00000280;
+	} else {
+		work->sapling = false;
+		memset(work->data + 19, 0x00, 52);
+		work->data[20] = 0x80000000;
+		work->data[31] = 0x00000280;
+	}
 
 	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
 		applog(LOG_ERR, "JSON invalid target");
@@ -1620,10 +1642,10 @@ static bool get_work(struct thr_info *thr, struct work *work)
 		if(opt_algo != ALGO_SIA)
 		{
 			memset(work->data, 0x55, 76);
-			memset(work->data + 19, 0x00, 52);
-			work->data[1] = (uint32_t)((double)rand() / (1ULL + RAND_MAX) * 0xffffffffu);
-			work->data[20] = 0x80000000;
-			work->data[31] = 0x00000280;
+		        work->data[17] = swab32(time(NULL));
+		        memset(work->data + 27, 0x00, 52);
+		        work->data[28] = 0x80000000;
+		        work->data[39] = 0x00000280;
 			memset(work->target, 0x00, sizeof(work->target));
 			work->datasize = 128;
 		}
@@ -1783,17 +1805,25 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	memset(work->data, 0, sizeof(work->data));
 	if(opt_algo != ALGO_SIA)
 	{
-		work->data[0] = le32dec(sctx->job.version);
+	        work->sapling = be32dec(sctx->job.version) == 5 ? true : false;	
+                work->data[0] = le32dec(sctx->job.version);
 		for(i = 0; i < 8; i++)
 			work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
 		for(i = 0; i < 8; i++)
 			work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
 		work->data[17] = le32dec(sctx->job.ntime);
 		work->data[18] = le32dec(sctx->job.nbits);
-		work->data[20] = 0x80000000;
-		work->data[31] = 0x00000280;
+        	if (work->sapling) {
+		        for (i = 0; i < 8; i++)
+			        work->data[20 + i] = le32dec((uint32_t *)sctx->job.finalsaplinghash + i);
+		        work->data[28] = 0x80000000;
+		        work->data[39] = 0x00000280;
+	        } else {
+	        	work->data[20] = 0x80000000;
+		        work->data[31] = 0x00000280;
+	        }
 	}
-	else
+        else
 	{
 		for(i = 0; i < 8; i++)
 			work->data[i] = le32dec((uint32_t *)sctx->job.prevhash + i);
@@ -1932,6 +1962,7 @@ static void *miner_thread(void *userdata)
 
 	while(!stop_mining)
 	{
+                int perslen = 80;
 		// &work.data[19]
 		int wcmplen;
 		switch(opt_algo)
@@ -2159,6 +2190,9 @@ static void *miner_thread(void *userdata)
 		}
 
 		/* scan nonces for a proof-of-work hash */
+		if (work.sapling)
+			perslen = 112;
+
 		switch(opt_algo)
 		{
 
@@ -2303,7 +2337,7 @@ static void *miner_thread(void *userdata)
 #ifndef ORG
 		case ALGO_YESCRYPT:
 			rc = scanhash_yescrypt(thr_id, work.data, work.target,
-							  max_nonce, &hashes_done);
+							  max_nonce, &hashes_done, perslen);
 			break;
 
 		case ALGO_YESCRYPTR8:

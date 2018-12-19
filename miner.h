@@ -379,7 +379,7 @@ extern int scanhash_x17(int thr_id, uint32_t *pdata,
 #ifndef ORG
 extern int scanhash_yescrypt(int thr_id, uint32_t *pdata,
 	uint32_t *ptarget, uint32_t max_nonce,
-	uint32_t *hashes_done);
+	uint32_t *hashes_done, int perslen);
 
 extern int scanhash_yescryptr8(int thr_id, uint32_t *pdata,
 	uint32_t *ptarget, uint32_t max_nonce,
@@ -612,6 +612,7 @@ uint32_t device_intensity(int thr_id, const char *func, uint32_t defcount);
 struct stratum_job {
 	char *job_id;
 	unsigned char prevhash[32];
+        unsigned char finalsaplinghash[32];
 	size_t coinbase_size;
 	unsigned char *coinbase;
 	unsigned char *xnonce2;
@@ -676,6 +677,7 @@ struct work {
 #ifndef ORG
 	char *txs2;
 	char *workid;
+        bool sapling;
 #endif
 };
 
