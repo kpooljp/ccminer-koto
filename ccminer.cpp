@@ -831,24 +831,25 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 		char data_str[2 * sizeof(work->data) + 1];
 		char *req;
+		int datasize = work->sapling ? 112 : 80;
 
 		for (int i = 0; i < ARRAY_SIZE(work->data); i++)
 			be32enc(work->data + i, work->data[i]);
-		cbin2hex(data_str, (char *)work->data, 80);
+		cbin2hex(data_str, (char *)work->data, datasize);
 		if (work->workid) {
 			char *params;
 			val = json_object();
 			json_object_set_new(val, "workid", json_string(work->workid));
 			params = json_dumps(val, 0);
 			json_decref(val);
-			req = (char*)malloc(128 + 2 * 80 + strlen(work->txs2) + strlen(params));
+			req = (char*)malloc(128 + 2 * datasize + strlen(work->txs2) + strlen(params));
 			sprintf(req,
 				"{\"method\": \"submitblock\", \"params\": [\"%s%s\", %s], \"id\":4}\r\n",
 				data_str, work->txs2, params);
 			free(params);
 		}
 		else {
-			req = (char*)malloc(128 + 2 * 80 + strlen(work->txs2));
+			req = (char*)malloc(128 + 2 * 2 * datasize + strlen(work->txs2));
 			sprintf(req,
 				"{\"method\": \"submitblock\", \"params\": [\"%s%s\"], \"id\":4}\r\n",
 				data_str, work->txs2);
@@ -862,8 +863,27 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		}
 
 		res = json_object_get(val, "result");
-		reason = json_object_get(val, "reject-reason");
-		if (!share_result(json_is_true(res), reason ? json_string_value(reason) : NULL))
+		int ret;
+		if (json_is_object(res))
+		{
+			char *res_str;
+			bool sumres = false;
+			void *iter = json_object_iter(res);
+			while (iter) {
+				if (json_is_null(json_object_iter_value(iter)))\
+				{
+					sumres = true;
+					break;
+				}
+				iter = json_object_iter_next(res, iter);
+			}
+			res_str = json_dumps(res, 0);
+			ret = share_result(sumres, res_str);
+			free(res_str);
+		} else {
+			ret = share_result(json_is_null(res), json_string_value(res));
+		}
+		if (!ret)
 		{
 			if (check_dups)
 				hashlog_purge_job(work->job_id);
@@ -875,7 +895,6 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 #endif
 	else
 	{
-
 		/* build hex string */
 		char *str = NULL;
 		for(int i = 0; i < (work->datasize >> 2); i++)
@@ -901,8 +920,27 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		}
 
 		res = json_object_get(val, "result");
-		reason = json_object_get(val, "reject-reason");
-		if(!share_result(json_is_true(res), reason ? json_string_value(reason) : NULL))
+		int ret;
+		if (json_is_object(res))
+		{
+			char *res_str;
+			bool sumres = false;
+			void *iter = json_object_iter(res);
+			while (iter) {
+				if (json_is_null(json_object_iter_value(iter)))\
+				{
+					sumres = true;
+					break;
+				}
+				iter = json_object_iter_next(res, iter);
+			}
+			res_str = json_dumps(res, 0);
+			ret = share_result(sumres, res_str);
+			free(res_str);
+		} else {
+			ret = share_result(json_is_null(res), json_string_value(res));
+		}
+		if (!ret)
 		{
 			if(check_dups)
 				hashlog_purge_job(work->job_id);
@@ -1015,12 +1053,14 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 	int tx_count, tx_size;
 	uchar txc_vi[9];
 	uchar(*merkle_tree)[32] = NULL;
+	uint32_t final_sapling_hash[8];
 	bool coinbase_append = false;
 	bool submit_coinbase = false;
 	bool version_force = false;
 	bool version_reduce = false;
 	json_t *tmp, *txa;
 	bool rc = false;
+	bool sapling = false;
 
 	tmp = json_object_get(val, "mutable");
 	if (tmp && json_is_array(tmp)) {
@@ -1054,7 +1094,9 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 		goto out;
 	}
 	version = (uint32_t)json_integer_value(tmp);
-	if ((version & 0xffU) > BLOCK_VERSION_CURRENT) {
+	if ((version & 0xffU) == 5) {
+		sapling = true;
+	} else if ((version & 0xffU) > BLOCK_VERSION_CURRENT) {
 		if (version_reduce) {
 			version = (version & ~0xffU) | BLOCK_VERSION_CURRENT;
 		}
@@ -1084,6 +1126,13 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 	if (unlikely(!jobj_binary(val, "bits", &bits, sizeof(bits)))) {
 		applog(LOG_ERR, "JSON invalid bits");
 		goto out;
+	}
+
+	if (sapling) {
+		if (unlikely(!jobj_binary(val, "finalsaplingroothash", final_sapling_hash, sizeof(final_sapling_hash)))) {
+			applog(LOG_ERR, "JSON invalid finalsaplingroothash");
+			goto out;
+		}
 	}
 
 	/* find count and size of transactions */
@@ -1236,9 +1285,21 @@ static bool gbt_work_decode_full(const json_t *val, struct work *work)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
 	work->data[17] = swab32(curtime);
 	work->data[18] = le32dec(&bits);
-	memset(work->data + 19, 0x00, 52);
-	work->data[20] = 0x80000000;
-	work->data[31] = 0x00000280;
+	if (sapling) {
+		work->sapling = true;
+		work->data[19] = 0x00000000;
+		for (i = 0; i < 8; i++)
+			work->data[27 - i] = le32dec(final_sapling_hash + i);
+		work->data[28] = 0x80000000;
+		work->data[29] = 0x00000000;
+		work->data[30] = 0x00000000;
+		work->data[31] = 0x00000380;
+	} else {
+		work->sapling = false;
+		memset(work->data + 19, 0x00, 52);
+		work->data[20] = 0x80000000;
+		work->data[31] = 0x00000280;
+	}
 
 	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
 		applog(LOG_ERR, "JSON invalid target");
@@ -1790,8 +1851,19 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
 		work->data[17] = le32dec(sctx->job.ntime);
 		work->data[18] = le32dec(sctx->job.nbits);
-		work->data[20] = 0x80000000;
-		work->data[31] = 0x00000280;
+		if (be32dec(sctx->job.version) >= 5) {
+			work->sapling = true;
+			for (i = 0; i < 8; i++)
+				work->data[20 + i] = le32dec((uint32_t *)sctx->job.finalsaplinghash + i);
+			work->data[28] = 0x80000000;
+			work->data[29] = 0x00000000;
+			work->data[30] = 0x00000000;
+			work->data[31] = 0x00000380;
+		} else {
+			work->sapling = false;
+			work->data[20] = 0x80000000;
+			work->data[31] = 0x00000280;
+		}
 	}
 	else
 	{
@@ -1871,6 +1943,7 @@ static void *miner_thread(void *userdata)
 	bool extrajob = false;
 	char s[16];
 	int rc = 0;
+	int perslen;
 
 	memset(&work, 0, sizeof(work)); // prevent work from being used uninitialized
 
@@ -2302,8 +2375,9 @@ static void *miner_thread(void *userdata)
 
 #ifndef ORG
 		case ALGO_YESCRYPT:
+			perslen =  work.sapling ? 112 : 80;
 			rc = scanhash_yescrypt(thr_id, work.data, work.target,
-							  max_nonce, &hashes_done);
+							  max_nonce, &hashes_done, perslen);
 			break;
 
 		case ALGO_YESCRYPTR8:
